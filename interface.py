@@ -134,7 +134,10 @@ class InterfaceGrafica:
         ctk.set_appearance_mode("Light")
 
         self.arquivos = GerenciadorArquivos()
-        self.motor = MotorRegras()
+        self.configuracoes = self.arquivos.carregar_config()
+        self.motor = MotorRegras(self.configuracoes)
+        self.limite_peso = self.configuracoes.get("limite_divergencia_peso", 10.0)
+        self.arquivo_atual = ""
         self.arquivo_atual = ""
         self.hawbs_finalizados = {}
         self.listas_copia = {"recepcionados": [], "pendentes": [], "concluidos": [], "fora": []}
@@ -315,6 +318,37 @@ class InterfaceGrafica:
 
         if self.caixa_entrada.get("1.0", tk.END).strip():
             self.processar_interface()
+    def desfazer_hawb(self):
+        # Pega o texto da mesma caixa usada para concluir
+        texto = self.caixa_concluir.get("1.0", tk.END).strip()
+        if not texto:
+            messagebox.showwarning("Aviso", "Digite o(s) HAWB(s) que deseja desfazer na caixa acima.")
+            return
+
+        # Extrai os HAWBs digitados (pode ser mais de um, separados por espaço ou vírgula)
+        hawbs = [h.strip() for h in re.split(r'[,\s\n]+', texto) if h.strip()]
+        hawbs_desfeitos = []
+        hawbs_nao_encontrados = []
+
+        # Tenta remover cada HAWB do dicionário de finalizados
+        for h in hawbs:
+            if h in self.hawbs_finalizados:
+                del self.hawbs_finalizados[h]
+                hawbs_desfeitos.append(h)
+            else:
+                hawbs_nao_encontrados.append(h)
+
+        # Limpa a caixa de texto
+        self.caixa_concluir.delete("1.0", tk.END)
+
+        # Se desfez pelo menos um, atualiza a tela instantaneamente
+        if hawbs_desfeitos:
+            if self.caixa_entrada.get("1.0", tk.END).strip():
+                self.processar_interface()
+            messagebox.showinfo("Sucesso", f"HAWB(s) retornado(s) ao status anterior:\n\n" + "\n".join(hawbs_desfeitos))
+        
+        if hawbs_nao_encontrados:
+            messagebox.showwarning("Aviso", "Estes HAWBs não estavam na lista de Concluídos:\n\n" + "\n".join(hawbs_nao_encontrados))
 
     def buscar_hawb(self):
         texto_busca = self.caixa_busca.get("1.0", tk.END).strip()
@@ -383,7 +417,7 @@ class InterfaceGrafica:
         elif "," in val:
             val = val.replace(",", ".")
         return float(val)
-
+    
     def formatar_valor_br(self, valor):
         return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -420,7 +454,7 @@ class InterfaceGrafica:
                 manif = self.converter_valor_br(ent_manifestado.get())
                 dif = (manif - decl) if tipo_calculo == "maior" else (decl - manif)
                 perc = (dif / decl) * 100 if decl != 0 else 0
-                alta_divergencia = abs(perc) > 10.1
+                alta_divergencia = abs(perc) > self.limite_peso
                 cor = CORES["danger"] if alta_divergencia else CORES["success_hover"]
                 fundo = CORES["danger_soft"] if alta_divergencia else CORES["success_soft"]
                 texto_alerta = "⚠️ ALTA DIVERGÊNCIA" if alta_divergencia else "✅ DENTRO DO LIMITE"
@@ -533,14 +567,15 @@ class InterfaceGrafica:
             widget.destroy()
 
         self.root.geometry("820x620")
-        self.root.minsize(760, 520)
+        self.root.minsize(800, 500)
         self.root.title("Guardião da Planilha")
         self.root.configure(fg_color=CORES["bg_light"])
+        self.root.resizable(True, True)
 
         menu_bar = tk.Menu(self.root)
 
         menu_arquivo = tk.Menu(menu_bar, tearoff=0)
-        menu_arquivo.add_command(label="Abrir / Carregar Novo...", command=self.opcao_2_carregar)
+        menu_arquivo.add_command(label="Abrir", command=self.opcao_2_carregar)
         menu_arquivo.add_command(label="Salvar Dados", command=self.salvar_dados)
         menu_bar.add_cascade(label="Arquivo", menu=menu_arquivo)
 
@@ -553,9 +588,9 @@ class InterfaceGrafica:
         menu_bar.add_cascade(label="Dados", menu=menu_dados)
         menu_bar.add_command(label="Calculadora", command=self.abrir_calculadora)
         menu_opcoes = tk.Menu(menu_bar, tearoff=0)
-        menu_opcoes.add_command(label="Voltar ao Início", command=self.voltar_inicio)
+        menu_opcoes.add_command(label="Inicio", command=self.voltar_inicio)
         menu_opcoes.add_separator()
-        menu_opcoes.add_command(label="Sair do Programa", command=self.fechar_programa)
+        menu_opcoes.add_command(label="Sair", command=self.fechar_programa)
         menu_bar.add_cascade(label="Opções", menu=menu_opcoes)
 
         self.root.config(menu=menu_bar)
@@ -587,7 +622,19 @@ class InterfaceGrafica:
         self.caixa_concluir._textbox.configure(undo=True)
         self.caixa_concluir.bind("<Control-y>", lambda e: self.caixa_concluir._textbox.edit_redo())
         self.caixa_concluir.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ctk.CTkButton(bloco2, text="CONCLUIR", command=self.concluir_hawb, **ESTILO_BTN_PRIMARIO).pack(fill=tk.X, padx=12, pady=(0, 12))
+        
+        # Cria um mini frame para colocar os dois botões lado a lado
+        f_botoes_concluir = ctk.CTkFrame(bloco2, fg_color="transparent")
+        f_botoes_concluir.pack(fill=tk.X, padx=12, pady=(0, 12))
+        
+        btn_concluir = ctk.CTkButton(f_botoes_concluir, text="CONCLUIR", command=self.concluir_hawb, width=90, **ESTILO_BTN_PRIMARIO)
+        btn_concluir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        # Adiciona o botão de desfazer usando a cor vermelha de perigo que você já tem no dicionário global
+        btn_desfazer = ctk.CTkButton(f_botoes_concluir, text="DESFAZER", command=self.desfazer_hawb, width=90, 
+                                     fg_color=CORES["danger"], hover_color=CORES["danger_hover"], 
+                                     text_color="white", font=(FONTE, 11, "bold"), height=34, corner_radius=10)
+        btn_desfazer.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
 
         bloco3 = self._criar_secao_sidebar(sidebar, 3, "BUSCAR STATUS", CORES["text_muted"])
         self.caixa_busca = ctk.CTkTextbox(bloco3, height=70, **ESTILO_TXTBOX)

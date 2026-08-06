@@ -7,13 +7,14 @@ class MotorRegras:
     CNPJ_REGEX = re.compile(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}')
     PESO_REGEX = re.compile(r'(\d{1,3}(?:\.\d{3})*,\d+|\d+,\d+)')
 
-    def __init__(self):
-        # Lista de CNPJs sob controle (set -> checagem "in" em O(1))
-        self.cnpjs_alvo = frozenset([
-            "48.122.295/0025-72", "48.122.295/0027-34",
-            "48.122.295/0024-91", "48.122.295/0026-53"
-        ])
-
+    def __init__(self, configuracoes):
+        # Recebe a lista do JSON e converte para frozenset (mantém a performance O(1))
+        lista_cnpjs = configuracoes.get("cnpjs_alvo", [])
+        self.cnpjs_alvo = frozenset(lista_cnpjs)
+        
+        # Puxa o limite de divergência dinamicamente (10.0 é o fallback)
+        self.limite_divergencia = configuracoes.get("limite_divergencia_peso", 10.0)
+        
     def converter_valor_br(self, valor_str):
         # Limpa e converte o formato de peso brasileiro (ex: 1.500,45) para float (1500.45)
         val = valor_str.strip()
@@ -49,25 +50,51 @@ class MotorRegras:
             return resultado
 
         linhas = [linha.strip() for linha in dados_brutos.split("\n") if linha.strip() != ""]
-        total_linhas = len(linhas)
+        
+        # 1. Agrupar as linhas em "blocos", onde cada bloco representa uma única HAWB
+        blocos = []
+        bloco_atual = []
+        for linha in linhas:
+            if linha.upper() == "HAWB":
+                if bloco_atual:
+                    blocos.append(bloco_atual)
+                bloco_atual = [linha]
+            elif bloco_atual:
+                bloco_atual.append(linha)
+                
+        # Adiciona o último bloco que ficou na memória
+        if bloco_atual:
+            blocos.append(bloco_atual)
+
         temp_concluidos = []
 
-        for i in range(total_linhas):
-            if linhas[i].upper() != "HAWB":
+        # 2. Processar cada bloco de forma independente
+        for bloco in blocos:
+            if len(bloco) < 2:
                 continue
 
-            hawb = linhas[i + 1] if i + 1 < total_linhas else "N/A"
-            linha_cnpj = linhas[i + 4] if i + 4 < total_linhas else ""
-            status = linhas[i + 5] if i + 5 < total_linhas else "N/A"  # Situação Atual
+            # A HAWB costuma ser sempre a linha imediatamente após o cabeçalho "HAWB"
+            hawb = bloco[1]
+            
+            cnpj_limpo = "S/CNPJ"
+            status = "N/A"
 
-            # Extração robusta do CNPJ ignorando sujeiras no texto
-            match_cnpj = self.CNPJ_REGEX.search(linha_cnpj)
-            cnpj_limpo = match_cnpj.group() if match_cnpj else "S/CNPJ"
+            # 3. Varrer o bloco para achar o CNPJ dinamicamente
+            for idx_linha, linha_texto in enumerate(bloco):
+                match_cnpj = self.CNPJ_REGEX.search(linha_texto)
+                if match_cnpj:
+                    cnpj_limpo = match_cnpj.group()
+                    
+                    # No Siscomex, o Status fica sempre posicionado logo após o CNPJ.
+                    # Como ancoramos no CNPJ, não importa quantas linhas "lixo" vieram antes!
+                    if idx_linha + 1 < len(bloco):
+                        status = bloco[idx_linha + 1]
+                    break  # Achou o CNPJ e o Status, pode parar de procurar neste bloco
 
             filial = cnpj_limpo.split("/")[1] if "/" in cnpj_limpo else "S/CNPJ"
             texto_formatado = f"{hawb} ({filial})"
 
-            # REGRA DE CNPJ: Se não for um dos 4, vai para Fora de Controle
+            # REGRA DE CNPJ: Se não for um dos alvos, vai para Fora de Controle
             if cnpj_limpo not in self.cnpjs_alvo:
                 status_final = f"FORA DE CONTROLE ({status})"
                 resultado["fora"].append(f"{texto_formatado} - {status_final}")
@@ -89,40 +116,31 @@ class MotorRegras:
 
             elif status.upper() == "RECEPCIONADA":
                 identificacao_peso = ""
-                bloco_linhas = []
-
-                # Isola as linhas pertencentes apenas a esta HAWB para buscar o peso
-                for j in range(i + 1, total_linhas):
-                    if linhas[j].upper() == "HAWB":
-                        break
-                    bloco_linhas.append(linhas[j])
-
-                bloco_texto = " ".join(bloco_linhas)
-
-                # Extrai todos os valores numéricos no formato brasileiro
+                
+                # Como já temos o bloco inteiro isolado, basta juntar o texto para achar os pesos
+                bloco_texto = " ".join(bloco)
                 pesos = self.PESO_REGEX.findall(bloco_texto)
 
-                # O padrão da tela colada exibe primeiro o peso Manifestado e depois o Declarado
                 if len(pesos) >= 2:
-                    peso_conhecimento = self.converter_valor_br(pesos[0])  # Manifestado (Aparece 1º)
-                    peso_estoque = self.converter_valor_br(pesos[1])       # Declarado / Estoque (Aparece 2º)
+                    peso_conhecimento = self.converter_valor_br(pesos[0])  # Manifestado
+                    peso_estoque = self.converter_valor_br(pesos[1])       # Declarado / Estoque
 
                     if peso_estoque > 0:
-                        # Cálculo de divergência mantendo o estoque (Declarado) como base divisora
                         divergencia = ((peso_conhecimento - peso_estoque) / peso_estoque) * 100
-
-                        # Classificação baseada no valor absoluto, acionando limite de 10%
-                        if abs(divergencia) > 10.0:
+                        
+                        # Usando a variável configurável que criamos no passo anterior
+                        if abs(divergencia) > self.limite_divergencia:
                             identificacao_peso = f" [⚠️ DIVERGÊNCIA: {divergencia:.2f}%]"
                         else:
                             identificacao_peso = f" [✅ PESO OK: {divergencia:.2f}%]"
 
                 status_final = f"RECEPCIONADA{identificacao_peso}"
-
                 resultado["acao"].append(f"{texto_formatado} - {status_final}")
+                
                 if hawb != "N/A":
                     resultado["lista_recepcionados"].append(hawb)
                     resultado["mapa_status"][hawb] = status_final
+                    
             else:
                 status_final = "AGUARDANDO"
                 resultado["pendentes"].append(f"{texto_formatado} - {status_final}")
@@ -130,7 +148,7 @@ class MotorRegras:
                     resultado["lista_pendentes"].append(hawb)
                     resultado["mapa_status"][hawb] = status_final
 
-        # Ordenação cronológica inteligente
+        # Ordenação cronológica inteligente dos concluídos
         def extrair_data(item):
             try:
                 return datetime.strptime(item["hora"], "%d/%m/%Y %H:%M:%S")
