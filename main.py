@@ -11,4 +11,3 @@ if __name__ == "__main__":
     app = InterfaceGrafica(raiz)
     raiz.mainloop()
     
-    
